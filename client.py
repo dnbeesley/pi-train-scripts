@@ -1,9 +1,9 @@
+import io
 import json
 import logging
 import uuid
 import schedule
 import stomper
-import stomper.stompbuffer
 import time
 import threading
 import websocket
@@ -14,8 +14,8 @@ READ_DEVICE_COMMAND = 4
 
 class TrainController():
     def __init__(self, url: str):
+        self._is_open: bool = False
         self.sensors: Dict[int, List[int]] = {}
-        self.stomp_buffer = stomper.stompbuffer.StompBuffer()
         self.web_socket = websocket.WebSocketApp(
             url,
             on_open=self._on_open,
@@ -25,15 +25,20 @@ class TrainController():
         )
 
     def __enter__(self):
+        self._is_open = False
         threading.Thread(target=self.web_socket.run_forever).start()
+        while self._is_open is False:
+            pass
         return self
 
-    def __exit__(self):
-        self.web_socket.send(stomper.disconnect())
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        msg = stomper.disconnect()
+        logging.debug(f'Sending: {msg}')
+        self.web_socket.send(msg)
         self.web_socket.close()
 
     def _log_headers(self, msg_name: str, headers: dict):
-        for (name, value) in headers:
+        for name, value in headers.items():
             logging.debug(f'{msg_name} has header {name}: {value}')
 
     def get_sensor_value(self, address: int, index: int):
@@ -55,24 +60,41 @@ class TrainController():
     def _on_error(self, ws: websocket.WebSocketApp, message: str):
         logging.error(f'Received error: {message}')
 
-    def _on_message(self, ws: websocket.WebSocketApp, message):
-        self.stomp_buffer.appendData(message)
-        while True:
-            msg = self.stomp_buffer.getOneMessage()
-            if msg is None:
-                break
+    def _on_message(self, ws: websocket.WebSocketApp, message: str):
+        logging.debug('# Enter _on_message()')
+        try:
+            buf = io.StringIO(message)
+            headers = {}
+            while True:
+                line = buf.readline()
+                if len(line.strip()) == 0:
+                    break
 
-            self._on_stomp_message(msg['headers'], msg['body'])
+                parts = line.split(':')
+                key = parts[0].strip().lower()
+                if len(parts) > 1:
+                    headers[key] = parts[1].strip()
+
+            body = message[buf.tell():].strip('\0')
+            self._on_stomp_message(headers, body)
+        finally:
+            logging.debug('# Exit _on_message()')
 
     def _on_open(self, ws: websocket.WebSocketApp):
         self.web_socket.send("CONNECT\naccept-version:1.0,1.1,2.0\n\n\x00\n")
         client_id = str(uuid.uuid4())
         sub = stomper.subscribe("/topic/response", client_id, ack='auto')
+        logging.debug(f'Sending: {sub}')
         self.web_socket.send(sub)
+        self._is_open = True
 
     def _on_stomp_message(self, headers: dict, body: str):
-        self._log_headers('Message', headers)
+        logging.debug('# Enter _on_stomp_message()')
         try:
+            self._log_headers('Message', headers)
+            if len(body.strip()) < 0:
+                return
+
             obj = json.loads(body)
             if 'cmd' in obj and obj['cmd'] == READ_DEVICE_COMMAND:
                 if 'address' not in obj:
@@ -89,16 +111,26 @@ class TrainController():
                     states = obj['states']
 
                 self.sensors[address] = states
+                logging.debug(f'Sensor: {address} has states: {states}')
+            else:
+                logging.debug(f'Response received: {obj}')
         except Exception as e:
             logging.exception(e)
+        finally:
+            logging.debug('# Exit _on_stomp_message()')
 
     def _send_read(self, address, length):
         body = {
             'address': address,
-            'length': length,
+            'length': length
         }
 
-        self.web_socket.send(stomper.send('/topic/sensor', json.dumps(body)))
+        msg = stomper.send(
+            '/topic/sensor',
+            json.dumps(body),
+            content_type='application/json')
+        logging.debug(f'Sending: {msg}')
+        self.web_socket.send(msg)
 
     def _wait_for_state(
             self,
@@ -107,17 +139,25 @@ class TrainController():
             length: int,
             condition: Callable[[int], bool],
             interval_seconds: float):
-        job = schedule.every(interval_seconds).seconds.do(
-            self._send_read, address=address, length=length)
-        del self.handler.sensors[address]
-        self._send_read(address, length)
-        value = None
-        while value is None or not condition(value):
-            schedule.run_pending()
-            value = self.handler.get_sensor_value(address, index)
-            time.sleep(0.1)
+        try:
+            del self.sensors[address]
+        except KeyError:
+            pass
 
-        schedule.cancel_job(job)
+        job: schedule.Job = None
+        try:
+            job = schedule.every(interval_seconds).seconds.do(
+                self._send_read, address=address, length=length)
+
+            self._send_read(address, length)
+            value = None
+            while value is None or not condition(value):
+                schedule.run_pending()
+                value = self.get_sensor_value(address, index)
+                time.sleep(0.001)
+        finally:
+            if job is not None:
+                schedule.cancel_job(job)
 
     def set_speed(self, channel: int, speed: int, reversed: bool):
         body = {
@@ -126,8 +166,12 @@ class TrainController():
             'reversed': reversed,
         }
 
-        self.web_socket.send(
-            stomper.send('/topic/motor-control', json.dumps(body)))
+        msg = stomper.send(
+            '/topic/motor-control',
+            json.dumps(body),
+            content_type='application/json')
+        logging.debug(f'Sending: {msg}')
+        self.web_socket.send(msg)
 
     def wait_for_state_gt(
             self,
