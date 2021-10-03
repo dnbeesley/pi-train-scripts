@@ -1,8 +1,8 @@
 import io
 import json
+from json.decoder import JSONDecodeError
 import logging
 import uuid
-import schedule
 import stomper
 import time
 import threading
@@ -33,7 +33,6 @@ class TrainController():
 
     def __exit__(self, exception_type, exception_value, exception_traceback):
         msg = stomper.disconnect()
-        logging.debug(f'Sending: {msg}')
         self.web_socket.send(msg)
         self.web_socket.close()
 
@@ -61,42 +60,42 @@ class TrainController():
         logging.error(f'Received error: {message}')
 
     def _on_message(self, ws: websocket.WebSocketApp, message: str):
-        logging.debug('# Enter _on_message()')
-        try:
-            buf = io.StringIO(message)
-            headers = {}
-            while True:
-                line = buf.readline()
-                if len(line.strip()) == 0:
-                    break
+        buf = io.StringIO(message)
+        headers = {}
+        while True:
+            line = buf.readline()
+            if len(line.strip()) == 0:
+                break
 
-                parts = line.split(':')
-                key = parts[0].strip().lower()
-                if len(parts) > 1:
-                    headers[key] = parts[1].strip()
+            parts = line.split(':')
+            key = parts[0].strip().lower()
+            if len(parts) > 1:
+                headers[key] = parts[1].strip()
 
-            body = message[buf.tell():].strip('\0')
-            self._on_stomp_message(headers, body)
-        finally:
-            logging.debug('# Exit _on_message()')
+        body = message[buf.tell():].strip('\0')
+        self._on_stomp_message(headers, body)
 
     def _on_open(self, ws: websocket.WebSocketApp):
         self.web_socket.send("CONNECT\naccept-version:1.0,1.1,2.0\n\n\x00\n")
         client_id = str(uuid.uuid4())
         sub = stomper.subscribe("/topic/response", client_id, ack='auto')
-        logging.debug(f'Sending: {sub}')
         self.web_socket.send(sub)
         self._is_open = True
 
     def _on_stomp_message(self, headers: dict, body: str):
-        logging.debug('# Enter _on_stomp_message()')
         try:
+            if ('destination' not in headers or
+                    headers['destination'] != '/topic/response'):
+                pass
             self._log_headers('Message', headers)
             if len(body.strip()) < 0:
+                logging.debug('Empty body received')
                 return
 
             obj = json.loads(body)
-            if 'cmd' in obj and obj['cmd'] == READ_DEVICE_COMMAND:
+            if (type(obj) == dict and
+                    'cmd' in obj and
+                    obj['cmd'] == READ_DEVICE_COMMAND):
                 if 'address' not in obj:
                     raise Exception(
                         'The "address" field was missing from the response to'
@@ -114,10 +113,10 @@ class TrainController():
                 logging.debug(f'Sensor: {address} has states: {states}')
             else:
                 logging.debug(f'Response received: {obj}')
+        except JSONDecodeError:
+            logging.error(f"Could not parse: '{body}'")
         except Exception as e:
             logging.exception(e)
-        finally:
-            logging.debug('# Exit _on_stomp_message()')
 
     def _send_read(self, address, length):
         body = {
@@ -129,7 +128,6 @@ class TrainController():
             '/topic/sensor',
             json.dumps(body),
             content_type='application/json')
-        logging.debug(f'Sending: {msg}')
         self.web_socket.send(msg)
 
     def _wait_for_state(
@@ -137,27 +135,23 @@ class TrainController():
             address: int,
             index: int,
             length: int,
-            condition: Callable[[int], bool],
-            interval_seconds: float):
+            condition: Callable[[int], bool]):
         try:
             del self.sensors[address]
         except KeyError:
             pass
 
-        job: schedule.Job = None
-        try:
-            job = schedule.every(interval_seconds).seconds.do(
-                self._send_read, address=address, length=length)
-
-            self._send_read(address, length)
-            value = None
-            while value is None or not condition(value):
-                schedule.run_pending()
-                value = self.get_sensor_value(address, index)
+        self._send_read(address, length)
+        while True:
+            value = self.get_sensor_value(address, index)
+            if value is None:
                 time.sleep(0.001)
-        finally:
-            if job is not None:
-                schedule.cancel_job(job)
+                continue
+            if condition(value):
+                break
+            else:
+                self._send_read(address, length)
+                del self.sensors[address]
 
     def set_speed(self, channel: int, speed: int, reversed: bool):
         body = {
@@ -170,7 +164,6 @@ class TrainController():
             '/topic/motor-control',
             json.dumps(body),
             content_type='application/json')
-        logging.debug(f'Sending: {msg}')
         self.web_socket.send(msg)
 
     def wait_for_state_gt(
@@ -178,14 +171,12 @@ class TrainController():
             address: int,
             index: int,
             length: int,
-            threashold: int,
-            interval_seconds: float):
+            threashold: int):
         self._wait_for_state(
             address,
             index,
             length,
-            lambda state: state > threashold,
-            interval_seconds
+            lambda state: state > threashold
         )
 
     def wait_for_state_lt(
@@ -193,12 +184,10 @@ class TrainController():
             address: int,
             index: int,
             length: int,
-            threashold: int,
-            interval_seconds: float):
+            threashold: int):
         self._wait_for_state(
             address,
             index,
             length,
-            lambda state: state < threashold,
-            interval_seconds
+            lambda state: state < threashold
         )
