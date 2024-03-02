@@ -4,17 +4,18 @@ from json.decoder import JSONDecodeError
 import logging
 import uuid
 import stomper
-import time
 import threading
 import websocket
 from typing import Callable, Dict, List
 
+READ_CURRENT_COMMAND = 3
 READ_DEVICE_COMMAND = 4
 
 
 class TrainController():
     def __init__(self, url: str):
         self._is_open: bool = False
+        self.current_sensors: Dict[int, int]
         self.sensors: Dict[int, List[int]] = {}
         self.web_socket = websocket.WebSocketApp(
             url,
@@ -43,6 +44,14 @@ class TrainController():
     def get_sensor_value(self, address: int, index: int):
         try:
             return self.sensors[address][index]
+        except KeyError:
+            return None
+        except IndexError:
+            return None
+
+    def get_current_sensor_value(self, index: int):
+        try:
+            return self.current_sensors[index]
         except KeyError:
             return None
         except IndexError:
@@ -94,29 +103,51 @@ class TrainController():
 
             obj = json.loads(body)
             if (type(obj) == dict and
-                    'cmd' in obj and
-                    obj['cmd'] == READ_DEVICE_COMMAND):
-                if 'address' not in obj:
-                    raise Exception(
-                        'The "address" field was missing from the response to'
-                        + 'a read device command')
-                else:
-                    address = obj['address']
-                if 'states' not in obj:
-                    raise Exception(
-                        'The "states" field was missing from the response to'
-                        + 'a read device command')
-                else:
-                    states = obj['states']
+                    'cmd' in obj):
+                if obj['cmd'] == READ_DEVICE_COMMAND:
+                    if 'address' not in obj:
+                        raise Exception(
+                            'The "address" field was missing from the response'
+                            ' to a read device command')
+                    else:
+                        address = obj['address']
+                    if 'states' not in obj:
+                        raise Exception(
+                            'The "states" field was missing from the response'
+                            ' to a read device command')
+                    else:
+                        states = obj['states']
 
-                self.sensors[address] = states
-                logging.debug(f'Sensor: {address} has states: {states}')
+                    self.sensors[address] = states
+                    logging.debug(f'Sensor: {address} has states: {states}')
+                elif obj['cmd'] == READ_CURRENT_COMMAND:
+                    if 'state' not in obj:
+                        raise Exception(
+                            'The "state" field was missing from the response'
+                            ' to a read device command')
+                    else:
+                        state = obj['state']
+
+                    self.current_sensors[0] = state
+                    logging.debug(f'Current sensor has state: {state}')
             else:
                 logging.debug(f'Response received: {obj}')
         except JSONDecodeError:
             logging.error(f"Could not parse: '{body}'")
         except Exception as e:
             logging.exception(e)
+
+    def _send_current_read(self, index):
+        body = {
+            'address': address,
+            'length': length
+        }
+
+        msg = stomper.send(
+            '/topic/sensor',
+            json.dumps(body),
+            content_type='application/json')
+        self.web_socket.send(msg)
 
     def _send_read(self, address, length):
         body = {
@@ -145,7 +176,7 @@ class TrainController():
         while True:
             value = self.get_sensor_value(address, index)
             if value is None:
-                time.sleep(0.001)
+                # time.sleep(0.001)
                 continue
             if condition(value):
                 break
